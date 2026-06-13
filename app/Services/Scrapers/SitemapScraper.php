@@ -5,10 +5,16 @@ namespace App\Services\Scrapers;
 use App\Models\Dealer;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
-use Symfony\Component\DomCrawler\Crawler;
 
 class SitemapScraper implements ScraperInterface
 {
+    protected UniversalScraper $universalScraper;
+
+    public function __construct()
+    {
+        $this->universalScraper = new UniversalScraper();
+    }
+
     public function canHandle(Dealer $dealer): bool
     {
         return $dealer->platform_type === 'earthstorm' || $dealer->platform_type === 'sitemap';
@@ -25,7 +31,7 @@ class SitemapScraper implements ScraperInterface
             if (!$xml) continue;
 
             try {
-                $parsed = simplexml_load_string($xml);
+                $parsed = @simplexml_load_string($xml);
                 if (!$parsed) continue;
 
                 foreach ($parsed->url ?? [] as $urlEntry) {
@@ -39,22 +45,22 @@ class SitemapScraper implements ScraperInterface
             }
         }
 
-        $universalScraper = new UniversalScraper();
-        $vehicles = [];
+        Log::info("Sitemap: found " . count($vehicleUrls) . " vehicle URLs for {$dealer->name}");
 
+        $vehicles = [];
         foreach ($vehicleUrls as $url) {
             try {
                 $html = $this->fetch($url);
                 if (!$html) continue;
 
-                $crawler = new Crawler($html);
-                $vehicle = $this->parseFromCrawler($crawler, $url, $dealer, $universalScraper);
+                $vehicle = $this->universalScraper->parseVehiclePagePublic($html, $url, $dealer);
                 if ($vehicle) {
                     $vehicles[] = $vehicle;
                 }
             } catch (\Throwable $e) {
                 Log::warning("Sitemap: failed to parse {$url}: {$e->getMessage()}");
             }
+            usleep(300000);
         }
 
         return $vehicles;
@@ -68,39 +74,38 @@ class SitemapScraper implements ScraperInterface
         }
 
         $candidates = [
-            $base . '/sitemap.xml',
-            $base . '/sitemap/vehicles.xml',
             $base . '/used.xml',
+            $base . '/sitemap/vehicles.xml',
+            $base . '/sitemap.xml',
             $base . '/sitemap_index.xml',
         ];
 
         $found = [];
         foreach ($candidates as $url) {
             $content = $this->fetch($url);
-            if ($content && str_contains($content, '<urlset') || str_contains($content, '<sitemapindex')) {
-                if (str_contains($content, '<sitemapindex')) {
-                    try {
-                        $index = simplexml_load_string($content);
-                        foreach ($index->sitemap ?? [] as $entry) {
-                            $loc = (string) $entry->loc;
-                            if (stripos($loc, 'vehicle') !== false || stripos($loc, 'used') !== false || stripos($loc, 'car') !== false || stripos($loc, 'stock') !== false) {
-                                $found[] = $loc;
-                            }
-                        }
-                    } catch (\Throwable $e) {}
+            if (!$content) continue;
 
-                    if (empty($found)) {
-                        try {
-                            foreach ($index->sitemap ?? [] as $entry) {
-                                $found[] = (string) $entry->loc;
-                            }
-                        } catch (\Throwable $e) {}
+            if (str_contains($content, '<sitemapindex')) {
+                try {
+                    $index = @simplexml_load_string($content);
+                    if (!$index) continue;
+                    foreach ($index->sitemap ?? [] as $entry) {
+                        $loc = (string) $entry->loc;
+                        if (preg_match('/vehicle|used|car|stock/i', $loc)) {
+                            $found[] = $loc;
+                        }
                     }
-                } else {
-                    $found[] = $url;
-                }
-                break;
+                    if (empty($found)) {
+                        foreach ($index->sitemap ?? [] as $entry) {
+                            $found[] = (string) $entry->loc;
+                        }
+                    }
+                } catch (\Throwable $e) {}
+            } elseif (str_contains($content, '<urlset')) {
+                $found[] = $url;
             }
+
+            if (!empty($found)) break;
         }
 
         return $found;
@@ -108,28 +113,22 @@ class SitemapScraper implements ScraperInterface
 
     protected function isVehicleUrl(string $url): bool
     {
-        $patterns = ['vehicle', 'car', 'used', 'stock', 'inventory'];
         $path = parse_url($url, PHP_URL_PATH) ?? '';
-
+        $patterns = ['/used/', '/vehicle/', '/car/', '/stock/', '/inventory/'];
         foreach ($patterns as $p) {
             if (stripos($path, $p) !== false) return true;
         }
-
         return false;
-    }
-
-    protected function parseFromCrawler(Crawler $crawler, string $url, Dealer $dealer, UniversalScraper $fallback): ?VehicleData
-    {
-        // Delegate to universal scraper's page parser via reflection or just re-fetch
-        $html = $crawler->html();
-        return $fallback->scrape($dealer)[0] ?? null; // Fallback - will be refined
     }
 
     protected function fetch(string $url): ?string
     {
         try {
             $response = Http::timeout(15)
-                ->withHeaders(['User-Agent' => 'Mozilla/5.0 (compatible; ListitBot/1.0)'])
+                ->withHeaders([
+                    'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0',
+                    'Accept' => 'text/html,application/xhtml+xml,application/xml',
+                ])
                 ->get($url);
             return $response->successful() ? $response->body() : null;
         } catch (\Throwable $e) {

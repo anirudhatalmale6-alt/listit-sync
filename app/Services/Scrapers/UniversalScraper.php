@@ -185,6 +185,11 @@ class UniversalScraper implements ScraperInterface
         return count($segments) >= 2 && preg_match('/\d/', $path);
     }
 
+    public function parseVehiclePagePublic(string $html, string $url, Dealer $dealer): ?VehicleData
+    {
+        return $this->parseVehiclePage($html, $url, $dealer);
+    }
+
     protected function parseVehiclePage(string $html, string $url, Dealer $dealer): ?VehicleData
     {
         $crawler = new Crawler($html);
@@ -197,8 +202,8 @@ class UniversalScraper implements ScraperInterface
 
         $parsed = $this->parseTitleForMakeModel($title);
         $images = $this->extractImages($crawler, $url);
-        $specs = $this->extractSpecs($crawler);
-        $price = $this->extractPrice($crawler, $html);
+        $specs = $this->extractSpecs($crawler, $html);
+        $price = isset($specs['price']) ? (float) $specs['price'] : $this->extractPrice($crawler, $html);
         $description = $this->extractDescription($crawler);
 
         // Extract source ID from URL - try query param first, then hash
@@ -234,10 +239,10 @@ class UniversalScraper implements ScraperInterface
     {
         $selectors = [
             'h1.vehicle-title', 'h1.car-title', '.vehicle-detail h1',
-            '.car-detail h1', '.listing-title h1', 'h1',
+            '.car-detail h1', '.listing-title h1', 'h1', 'h2', 'h3',
         ];
 
-        $genericPatterns = ['car sales', 'vehicle sales', 'used cars', 'showroom', 'home page', 'welcome'];
+        $genericPatterns = ['car sales', 'vehicle sales', 'used cars', 'showroom', 'home page', 'welcome', 'value your car', 'sell your car', 'trade in'];
 
         foreach ($selectors as $selector) {
             try {
@@ -257,6 +262,25 @@ class UniversalScraper implements ScraperInterface
                 continue;
             }
         }
+
+        // Try <title> tag as last resort
+        try {
+            $titleTag = $crawler->filter('title')->first();
+            if ($titleTag->count()) {
+                $text = trim($titleTag->text(''));
+                // Extract vehicle name from "Used Porsche 718 Spyder - Van Mossel" format
+                $text = preg_replace('/\s*[-|]\s*.*$/', '', $text);
+                $text = preg_replace('/^Used\s+/i', '', $text);
+                if ($text && strlen($text) > 5 && strlen($text) < 150) {
+                    $lower = strtolower($text);
+                    $isGeneric = false;
+                    foreach ($genericPatterns as $gp) {
+                        if (str_contains($lower, $gp)) { $isGeneric = true; break; }
+                    }
+                    if (!$isGeneric) return $text;
+                }
+            }
+        } catch (\Throwable $e) {}
 
         return null;
     }
@@ -417,9 +441,23 @@ class UniversalScraper implements ScraperInterface
         return null;
     }
 
-    protected function extractSpecs(Crawler $crawler): array
+    protected function extractSpecs(Crawler $crawler, string $html = ''): array
     {
         $specs = [];
+
+        // Try JavaScript embedded data (Earthstorm/modern sites)
+        if ($html) {
+            $jsMap = [
+                'cashPrice' => 'price',
+                'mileage' => 'mileage',
+            ];
+            foreach ($jsMap as $jsKey => $specKey) {
+                if (preg_match('/' . preg_quote($jsKey) . '\s*:\s*(\d+)/', $html, $m)) {
+                    $specs[$specKey] = $m[1];
+                }
+            }
+        }
+
         $specLabels = [
             'make' => ['make', 'manufacturer', 'brand'],
             'model' => ['model'],
