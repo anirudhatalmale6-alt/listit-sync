@@ -64,11 +64,34 @@ class UniversalScraper implements ScraperInterface
             '/showroom', '/for-sale', '/available',
         ];
 
+        // Check each candidate path, verify it has vehicle-like links
         foreach ($stockPaths as $path) {
             $url = $base . $path;
-            $response = Http::timeout(10)->get($url);
-            if ($response->successful() && strlen($response->body()) > 1000) {
-                return $url;
+            try {
+                $response = Http::timeout(10)
+                    ->withHeaders(['User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0'])
+                    ->get($url);
+                if ($response->successful() && strlen($response->body()) > 1000) {
+                    $body = $response->body();
+                    if (preg_match('/href="[^"]*(?:vehicle|car|used|stock|our-cars|listing)[^"]*"/i', $body)) {
+                        return $url;
+                    }
+                }
+            } catch (\Throwable $e) {
+                continue;
+            }
+        }
+
+        // Fallback: return first page that loads, even without vehicle links
+        foreach ($stockPaths as $path) {
+            $url = $base . $path;
+            try {
+                $response = Http::timeout(10)->get($url);
+                if ($response->successful() && strlen($response->body()) > 1000) {
+                    return $url;
+                }
+            } catch (\Throwable $e) {
+                continue;
             }
         }
 
@@ -144,6 +167,12 @@ class UniversalScraper implements ScraperInterface
             if (stripos($url, $skip) !== false) return false;
         }
 
+        // Check for query-string vehicle detail pages (/vehicle?id=xxx)
+        $query = parse_url($url, PHP_URL_QUERY) ?? '';
+        if (stripos($path, '/vehicle') !== false && str_contains($query, 'id=')) {
+            return true;
+        }
+
         $detailPatterns = ['/vehicle/', '/car/', '/car-for-sale', '/stock/', '/used-', '/detail', '/listing/', '/our-cars/', '/our-stock/', '/usedcars/', '/cars-for-sale/'];
         foreach ($detailPatterns as $pattern) {
             if (stripos($path, $pattern) !== false) {
@@ -172,7 +201,10 @@ class UniversalScraper implements ScraperInterface
         $price = $this->extractPrice($crawler, $html);
         $description = $this->extractDescription($crawler);
 
-        $sourceId = md5($url);
+        // Extract source ID from URL - try query param first, then hash
+        $queryStr = parse_url($url, PHP_URL_QUERY) ?? '';
+        parse_str($queryStr, $queryParams);
+        $sourceId = $queryParams['id'] ?? md5($url);
 
         return new VehicleData(
             sourceId: $sourceId,
